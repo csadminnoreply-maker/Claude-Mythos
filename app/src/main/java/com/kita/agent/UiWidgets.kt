@@ -3,6 +3,10 @@ package com.kita.agent
 import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.Canvas
+import android.graphics.ColorFilter
+import android.graphics.Path
+import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Matrix
@@ -10,18 +14,21 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
-import android.view.View
+import android.graphics.drawable.Drawable
 import android.view.animation.LinearInterpolator
+import android.view.View
 import android.widget.TextView
 import kotlin.math.sin
 
-/** Ikon sederhana yang digambar lewat kode (tanpa file gambar). */
+/** Ikon vektor yang digambar lewat kode: tajam di semua kepadatan layar, tanpa file gambar. */
 class IconView(ctx: Context, t: Int, c: Int = Color.parseColor("#1F1F1F")) : View(ctx) {
     var type: Int = t
         set(v) { field = v; invalidate() }
     var color: Int = c
         set(v) { field = v; invalidate() }
-    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
+    private val path = Path()
+    private val rect = RectF()
 
     companion object {
         const val MENU = 0
@@ -37,6 +44,8 @@ class IconView(ctx: Context, t: Int, c: Int = Color.parseColor("#1F1F1F")) : Vie
         const val TRASH = 10
         const val STOP = 11
         const val FOLDER = 12
+        const val SPARKLE = 13
+        const val BUBBLE = 14
     }
 
     override fun onDraw(c: Canvas) {
@@ -51,28 +60,71 @@ class IconView(ctx: Context, t: Int, c: Int = Color.parseColor("#1F1F1F")) : Vie
         p.color = color
         when (type) {
             MENU -> {
-                c.drawLine(cx - s * 0.28f, cy - s * 0.09f, cx + s * 0.28f, cy - s * 0.09f, p)
-                c.drawLine(cx - s * 0.28f, cy + s * 0.09f, cx + s * 0.28f, cy + s * 0.09f, p)
+                // dua garis rata kiri: atas panjang, bawah pendek
+                p.strokeWidth = s * 0.058f
+                c.drawLine(cx - s * 0.17f, cy - s * 0.09f, cx + s * 0.21f, cy - s * 0.09f, p)
+                c.drawLine(cx - s * 0.17f, cy + s * 0.09f, cx + s * 0.04f, cy + s * 0.09f, p)
             }
             PLUS -> {
-                c.drawLine(cx - s * 0.28f, cy, cx + s * 0.28f, cy, p)
-                c.drawLine(cx, cy - s * 0.28f, cx, cy + s * 0.28f, p)
+                p.strokeWidth = s * 0.05f
+                c.drawLine(cx - s * 0.195f, cy, cx + s * 0.195f, cy, p)
+                c.drawLine(cx, cy - s * 0.195f, cx, cy + s * 0.195f, p)
             }
             MIC -> {
-                c.drawRoundRect(RectF(cx - s * 0.1f, cy - s * 0.3f, cx + s * 0.1f, cy + s * 0.05f), s * 0.1f, s * 0.1f, p)
-                c.drawArc(RectF(cx - s * 0.2f, cy - s * 0.16f, cx + s * 0.2f, cy + s * 0.2f), 0f, 180f, false, p)
-                c.drawLine(cx, cy + s * 0.2f, cx, cy + s * 0.32f, p)
+                p.strokeWidth = s * 0.05f
+                rect.set(cx - s * 0.135f, cy - s * 0.23f, cx + s * 0.135f, cy + s * 0.06f)
+                c.drawRoundRect(rect, s * 0.135f, s * 0.135f, p)
+                rect.set(cx - s * 0.23f, cy - s * 0.07f, cx + s * 0.23f, cy + s * 0.2f)
+                c.drawArc(rect, 0f, 180f, false, p)
+                c.drawLine(cx, cy + s * 0.2f, cx, cy + s * 0.27f, p)
+                c.drawLine(cx - s * 0.09f, cy + s * 0.27f, cx + s * 0.09f, cy + s * 0.27f, p)
             }
             SEND -> {
-                c.drawLine(cx, cy + s * 0.24f, cx, cy - s * 0.24f, p)
-                c.drawLine(cx - s * 0.2f, cy - s * 0.04f, cx, cy - s * 0.24f, p)
-                c.drawLine(cx + s * 0.2f, cy - s * 0.04f, cx, cy - s * 0.24f, p)
+                p.strokeWidth = s * 0.075f
+                c.drawLine(cx, cy + s * 0.2f, cx, cy - s * 0.2f, p)
+                c.drawLine(cx - s * 0.17f, cy - s * 0.03f, cx, cy - s * 0.2f, p)
+                c.drawLine(cx + s * 0.17f, cy - s * 0.03f, cx, cy - s * 0.2f, p)
             }
             WAVE -> {
-                p.strokeWidth = s * 0.07f
-                c.drawLine(cx - s * 0.18f, cy - s * 0.1f, cx - s * 0.18f, cy + s * 0.1f, p)
-                c.drawLine(cx, cy - s * 0.24f, cx, cy + s * 0.24f, p)
-                c.drawLine(cx + s * 0.18f, cy - s * 0.14f, cx + s * 0.18f, cy + s * 0.14f, p)
+                // lima batang gelombang suara
+                p.strokeWidth = s * 0.066f
+                val hs = floatArrayOf(0.07f, 0.15f, 0.21f, 0.13f, 0.07f)
+                for (i in 0..4) {
+                    val x = cx + (i - 2) * s * 0.1f
+                    c.drawLine(x, cy - s * hs[i], x, cy + s * hs[i], p)
+                }
+            }
+            SPARKLE -> {
+                // bintang empat sudut (terisi)
+                val r = s * 0.47f
+                val k = r * 0.17f
+                path.reset()
+                path.moveTo(cx, cy - r)
+                path.quadTo(cx + k, cy - k, cx + r, cy)
+                path.quadTo(cx + k, cy + k, cx, cy + r)
+                path.quadTo(cx - k, cy + k, cx - r, cy)
+                path.quadTo(cx - k, cy - k, cx, cy - r)
+                path.close()
+                p.style = Paint.Style.FILL_AND_STROKE
+                p.strokeWidth = s * 0.05f
+                c.drawPath(path, p)
+            }
+            BUBBLE -> {
+                // gelembung obrolan putus-putus dengan ekor kiri bawah
+                p.strokeWidth = s * 0.05f
+                val r = s * 0.215f
+                rect.set(cx - r, cy - r, cx + r, cy + r)
+                c.drawArc(rect, 203f, 66f, false, p)
+                c.drawArc(rect, 292f, 56f, false, p)
+                c.drawArc(rect, 12f, 56f, false, p)
+                c.drawArc(rect, 88f, 36f, false, p)
+                val a1 = Math.toRadians(128.0)
+                val a2 = Math.toRadians(172.0)
+                path.reset()
+                path.moveTo(cx + r * Math.cos(a1).toFloat(), cy + r * Math.sin(a1).toFloat())
+                path.lineTo(cx - r * 1.28f, cy + r * 1.22f)
+                path.lineTo(cx + r * Math.cos(a2).toFloat(), cy + r * Math.sin(a2).toFloat())
+                c.drawPath(path, p)
             }
             NEW -> {
                 c.drawRoundRect(RectF(cx - s * 0.26f, cy - s * 0.2f, cx + s * 0.2f, cy + s * 0.26f), s * 0.08f, s * 0.08f, p)
@@ -104,28 +156,24 @@ class IconView(ctx: Context, t: Int, c: Int = Color.parseColor("#1F1F1F")) : Vie
                 c.drawLine(cx, cy, cx + s * 0.12f, cy + s * 0.06f, p)
             }
             TRASH -> {
-                // tutup dan gagang
                 c.drawLine(cx - s * 0.27f, cy - s * 0.17f, cx + s * 0.27f, cy - s * 0.17f, p)
                 c.drawLine(cx - s * 0.08f, cy - s * 0.17f, cx - s * 0.08f, cy - s * 0.27f, p)
                 c.drawLine(cx + s * 0.08f, cy - s * 0.17f, cx + s * 0.08f, cy - s * 0.27f, p)
                 c.drawLine(cx - s * 0.08f, cy - s * 0.27f, cx + s * 0.08f, cy - s * 0.27f, p)
-                // badan tempat sampah
                 c.drawLine(cx - s * 0.2f, cy - s * 0.17f, cx - s * 0.16f, cy + s * 0.28f, p)
                 c.drawLine(cx - s * 0.16f, cy + s * 0.28f, cx + s * 0.16f, cy + s * 0.28f, p)
                 c.drawLine(cx + s * 0.16f, cy + s * 0.28f, cx + s * 0.2f, cy - s * 0.17f, p)
-                // garis di dalam
                 c.drawLine(cx - s * 0.06f, cy - s * 0.06f, cx - s * 0.06f, cy + s * 0.18f, p)
                 c.drawLine(cx + s * 0.06f, cy - s * 0.06f, cx + s * 0.06f, cy + s * 0.18f, p)
             }
             STOP -> {
                 p.style = Paint.Style.FILL
                 c.drawRoundRect(
-                    RectF(cx - s * 0.18f, cy - s * 0.18f, cx + s * 0.18f, cy + s * 0.18f),
-                    s * 0.05f, s * 0.05f, p
+                    RectF(cx - s * 0.15f, cy - s * 0.15f, cx + s * 0.15f, cy + s * 0.15f),
+                    s * 0.045f, s * 0.045f, p
                 )
             }
             FOLDER -> {
-                p.style = Paint.Style.STROKE
                 c.drawRoundRect(RectF(cx - s * 0.3f, cy - s * 0.12f, cx + s * 0.3f, cy + s * 0.26f), s * 0.06f, s * 0.06f, p)
                 c.drawLine(cx - s * 0.3f, cy - s * 0.06f, cx - s * 0.12f, cy - s * 0.06f, p)
                 c.drawLine(cx - s * 0.12f, cy - s * 0.06f, cx - s * 0.04f, cy - s * 0.2f, p)
@@ -135,9 +183,35 @@ class IconView(ctx: Context, t: Int, c: Int = Color.parseColor("#1F1F1F")) : Vie
     }
 }
 
+/**
+ * Latar gradasi: putih di atas, perlahan menjadi biru langit di bawah.
+ * Memakai dithering agar tidak ada pita warna (banding) pada layar OLED.
+ */
+class SkyDrawable : Drawable() {
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
+    private val colors = intArrayOf(
+        Color.parseColor("#FDFEFF"), Color.parseColor("#FCFDFE"), Color.parseColor("#F3F9FE"),
+        Color.parseColor("#E0EFFC"), Color.parseColor("#C9E4FB"), Color.parseColor("#B1D9FB"),
+        Color.parseColor("#99CEFC")
+    )
+    private val pos = floatArrayOf(0f, 0.35f, 0.5f, 0.61f, 0.72f, 0.84f, 1f)
+
+    override fun onBoundsChange(b: Rect) {
+        p.shader = LinearGradient(
+            0f, b.top.toFloat(), 0f, b.bottom.toFloat(), colors, pos, Shader.TileMode.CLAMP
+        )
+    }
+
+    override fun draw(c: Canvas) { c.drawRect(bounds, p) }
+    override fun setAlpha(a: Int) { p.alpha = a }
+    override fun setColorFilter(cf: ColorFilter?) { p.colorFilter = cf }
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun getOpacity(): Int = PixelFormat.OPAQUE
+}
+
 /** Tiga titik oranye yang berdenyut: penanda "sedang berpikir/menganalisa". */
 class DotsView(ctx: Context) : View(ctx) {
-    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#D97757") }
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#0B72D9") }
     private var t = 0f
     private var anim: ValueAnimator? = null
 

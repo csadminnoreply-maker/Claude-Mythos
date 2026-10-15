@@ -13,7 +13,10 @@ import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.PackageInstaller
 import android.graphics.Color
+import android.content.res.ColorStateList
 import android.graphics.Typeface
+import android.graphics.drawable.RippleDrawable
+import android.util.TypedValue
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
@@ -48,6 +51,7 @@ import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.Spinner
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
@@ -68,6 +72,8 @@ private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 private const val USER = 0
 private const val AI = 1
 private const val KIND_DOTS = -1
+private const val BLUE_ACTION = "#0AACFF"
+private const val BLUE = "#0B72D9"
 
 class MainActivity : Activity() {
 
@@ -128,9 +134,11 @@ class MainActivity : Activity() {
 
     private lateinit var chatBox: LinearLayout
     private lateinit var scroll: ScrollView
-    private lateinit var emptyState: LinearLayout
+    private lateinit var emptyState: View
     private lateinit var folderHint: TextView
     private lateinit var modelLabel: TextView
+    private var modelChip: TextView? = null
+    private var welcomeFolder: TextView? = null
     private lateinit var input: EditText
     private lateinit var actionIcon: IconView
     private lateinit var actionBg: GradientDrawable
@@ -157,6 +165,8 @@ class MainActivity : Activity() {
     private val approvalQueue = AtomicReference<LinkedBlockingQueue<Boolean>?>(null)
     private var approvalDialog: AlertDialog? = null
     private var pendingInstall: File? = null
+    // true hanya setelah pengguna membuka halaman izin; mencegah pemasangan otomatis saat kembali dari layar lain (mis. pemilih file).
+    private var awaitingInstallPermission = false
     private var installReceiver: BroadcastReceiver? = null
     @Volatile private var installSessionId = -1
 
@@ -168,6 +178,69 @@ class MainActivity : Activity() {
     private fun col(s: String) = Color.parseColor(s)
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+    // Skala proporsional terhadap lebar layar contoh (874 px) agar tata letak 1:1 di semua HP.
+    private val ui: Float by lazy {
+        minOf(resources.displayMetrics.widthPixels.toFloat(), 480f * resources.displayMetrics.density) / 874f
+    }
+    private fun u(v: Float): Int = Math.round(v * ui)
+
+    /** Ukuran teks (px): proporsional dengan layar, tetapi tidak pernah di bawah [minSp]. */
+    private fun tsz(v: Float, minSp: Float = 14f): Float = maxOf(
+        v * ui,
+        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, minSp, resources.displayMetrics)
+    )
+
+    private fun ripple(round: Boolean, alpha: Int): RippleDrawable {
+        val a = if (alpha > 0) alpha else 28
+        val tint = if (alpha > 0) Color.argb(a, 255, 255, 255) else Color.argb(a, 0, 0, 0)
+        val mask = GradientDrawable().apply {
+            setColor(Color.BLACK)
+            if (round) cornerRadius = u(100f).toFloat() else shape = GradientDrawable.OVAL
+        }
+        return RippleDrawable(ColorStateList.valueOf(tint), null, mask)
+    }
+
+    private fun softShadow(v: View, elev: Float, alpha: Int) {
+        v.elevation = elev
+        if (Build.VERSION.SDK_INT >= 28) {
+            v.outlineAmbientShadowColor = Color.argb(alpha, 30, 80, 140)
+            v.outlineSpotShadowColor = Color.argb(alpha, 30, 80, 140)
+        }
+    }
+
+    /** Tombol bulat putih dengan bayangan lembut (menu & obrolan baru di bilah atas). */
+    private fun roundButton(icon: IconView, onClick: () -> Unit): FrameLayout = FrameLayout(this).apply {
+        background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.WHITE) }
+        softShadow(this, u(4f).toFloat(), 38)
+        foreground = ripple(false, 0)
+        addView(icon, FrameLayout.LayoutParams(MATCH, MATCH))
+        setOnClickListener { onClick() }
+    }
+
+    /** Menu pada tombol "Tingkatkan": model, pengaturan, folder kerja, hapus. */
+    private fun showMainMenu(anchor: View) {
+        val model = if (preset(prov).fmt == "cli") "CLI" else cfgModel().ifBlank { prov }
+        val m = PopupMenu(this, anchor)
+        m.menu.add(0, 1, 0, "Ganti model · $model")
+        m.menu.add(0, 5, 1, "Riwayat percakapan")
+        m.menu.add(0, 6, 2, "Percakapan baru")
+        m.menu.add(0, 3, 3, folderHint.text.toString())
+        m.menu.add(0, 2, 4, "Pengaturan")
+        m.menu.add(0, 4, 5, "Hapus percakapan ini")
+        m.setOnMenuItemClickListener { mi ->
+            when (mi.itemId) {
+                1 -> pickModel()
+                2 -> showSettings()
+                3 -> pickWorkDir()
+                4 -> confirmDelete()
+                5 -> showHistory()
+                6 -> newChat()
+            }
+            true
+        }
+        m.show()
+    }
 
     private fun decl(name: String, desc: String, vararg params: Pair<String, String>): JSONObject {
         val props = JSONObject()
@@ -207,101 +280,78 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        installCrashLogger()
         prefs = getSharedPreferences("cfg", MODE_PRIVATE)
         try { migrateKeys() } catch (_: Exception) {}
         prov = prefs.getString("prov", "Gemini") ?: "Gemini"
 
-        window.statusBarColor = col("#FAFAFA")
-        window.navigationBarColor = col("#A9D3FA")
-        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+        window.statusBarColor = col("#FDFEFF")
+        window.navigationBarColor = col("#99CEFC")
+        var flags = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+        if (Build.VERSION.SDK_INT >= 26) flags = flags or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        window.decorView.systemUiVisibility = flags
 
-        val bg = GradientDrawable(
-            GradientDrawable.Orientation.TOP_BOTTOM,
-            intArrayOf(col("#FAFAFA"), col("#FAFAFA"), col("#FAFAFA"), col("#EAF3FD"), col("#9CCBFA"))
-        )
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = bg
+            background = SkyDrawable()
         }
 
-        // Bilah atas: menu, pemilih model, chat baru, avatar
-        val menuBtn = IconView(this, IconView.MENU).apply { setOnClickListener { showSettings() } }
-        modelLabel = TextView(this).apply {
-            textSize = 17f
-            setTextColor(col("#1F1F1F"))
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), 0, dp(12), 0)
-            maxLines = 1
+        // ---- Bilah atas: [menu]  [✦ Tingkatkan] ............ [obrolan baru]
+        val menuIcon = IconView(this, IconView.MENU, col("#111111"))
+        val menuBtn = roundButton(menuIcon) { showHistory() }.also { it.contentDescription = "Riwayat percakapan" }
+        val upgradeText = TextView(this).apply {
+            text = "Pilih model"
+            maxWidth = u(430f)
             ellipsize = TextUtils.TruncateAt.END
-            setOnClickListener { pickModel() }
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, tsz(29.5f))
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setTextColor(col("#0B6FD2"))
+            includeFontPadding = false
+            maxLines = 1
         }
-        val histBtn = IconView(this, IconView.CLOCK).apply { setOnClickListener { showHistory() } }
-        val newBtn = IconView(this, IconView.TRASH).apply { setOnClickListener { confirmDelete() } }
-        val avatar = FrameLayout(this).apply {
-            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(col("#E3EEFB")) }
-            addView(MarkView(context), FrameLayout.LayoutParams(dp(28), dp(28), Gravity.CENTER))
+        modelChip = upgradeText
+        val upgradeBtn = LinearLayout(this).apply {
+            contentDescription = "Model dan menu"
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = GradientDrawable().apply { setColor(col("#E6F1FD")); cornerRadius = u(100f).toFloat() }
+            foreground = ripple(true, 0)
+            setPadding(u(25f), 0, u(31f), 0)
+            addView(IconView(this@MainActivity, IconView.SPARKLE, col("#0B72D9")), LinearLayout.LayoutParams(u(30f), u(30f)))
+            addView(upgradeText, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = u(17f) })
+            setOnClickListener { showMainMenu(this) }
         }
+        val tempIcon = IconView(this, IconView.BUBBLE, col("#111111"))
+        val tempBtn = roundButton(tempIcon) { newChat() }.also { it.contentDescription = "Percakapan baru" }
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(6), dp(12), dp(6))
-            addView(menuBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
-            addView(modelLabel, LinearLayout.LayoutParams(0, MATCH, 1f))
-            addView(histBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
-            addView(newBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
-            addView(avatar, LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginStart = dp(8) })
+            setPadding(u(32f), u(24f), u(32f), u(18f))
+            clipChildren = false
+            clipToPadding = false
+            addView(menuBtn, LinearLayout.LayoutParams(u(88f), u(88f)))
+            addView(upgradeBtn, LinearLayout.LayoutParams(WRAP, u(88f)).apply { marginStart = u(16f) })
+            addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
+            addView(tempBtn, LinearLayout.LayoutParams(u(88f), u(88f)))
         }
-        updateModelLabel()
 
-        // Area tengah: daftar chat + sapaan kosong
+        // Label model & petunjuk folder tetap ada (dipakai menu), tetapi tidak ditampilkan di layar utama
+        modelLabel = TextView(this)
+        updateModelLabel()
+        folderHint = TextView(this)
+        updateFolderHint()
+
+        // ---- Area tengah: daftar chat (kosong = layar bersih seperti contoh)
         chatBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(8), dp(16), dp(16))
+            setPadding(u(32f), dp(4), u(32f), dp(16))
         }
-        scroll = ScrollView(this).apply { addView(chatBox) }
-        emptyState = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            addView(MarkView(context), LinearLayout.LayoutParams(dp(72), dp(72)).apply { bottomMargin = dp(20) })
-            addView(TextView(context).apply {
-                text = "Halo, saya Kita Agent"
-                textSize = 26f
-                setTextColor(col("#1F1F1F"))
-                gravity = Gravity.CENTER
-                setPadding(dp(24), 0, dp(24), 0)
-            })
-            addView(TextView(context).apply {
-                text = "Ada yang bisa saya bantu?"
-                textSize = 17f
-                setTextColor(col("#757575"))
-                gravity = Gravity.CENTER
-                setPadding(0, dp(8), 0, dp(18))
-            })
-            for (ex in listOf(
-                "Jelaskan isi folder kerja ini",
-                "Cari bug di proyek ini lalu perbaiki",
-                "Build aplikasi dan beri tahu hasilnya"
-            )) {
-                addView(TextView(context).apply {
-                    text = ex
-                    textSize = 15f
-                    setTextColor(col("#0F766E"))
-                    gravity = Gravity.CENTER
-                    background = GradientDrawable().apply {
-                        setColor(col("#F0F8F6"))
-                        setStroke(dp(1), col("#BFE3DD"))
-                        cornerRadius = dp(22).toFloat()
-                    }
-                    setPadding(dp(18), dp(11), dp(18), dp(11))
-                    setOnClickListener {
-                        if (busy) return@setOnClickListener
-                        input.setText(ex)
-                        input.setSelection(input.text.length)
-                        send()
-                    }
-                }, LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = dp(8) })
-            }
+        scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(chatBox)
         }
+        emptyState = buildWelcome()
         val center = FrameLayout(this).apply {
             addView(scroll, FrameLayout.LayoutParams(MATCH, MATCH))
             addView(emptyState, FrameLayout.LayoutParams(MATCH, MATCH))
@@ -309,22 +359,38 @@ class MainActivity : Activity() {
 
         buildStatusRow()
 
-        // Kolom input bulat di bawah
-        val plusBtn = IconView(this, IconView.PLUS).apply { setOnClickListener { showTemplates(this) } }
+        // ---- Kolom input kapsul: [+]  Tanya ...  [mic] (●)
+        val plusIcon = IconView(this, IconView.PLUS, col("#111111"))
+        val plusBtn = plusIcon.apply {
+            contentDescription = "Lampirkan file dan contoh perintah"
+            foreground = ripple(false, 0)
+            setOnClickListener { showTemplates(this) }
+        }
         input = EditText(this).apply {
-            hint = "Minta Kita Agent..."
-            textSize = 16f
+            hint = "Ketik perintah atau pertanyaan"
+            setHintTextColor(col("#ABABB0"))
+            setTextColor(col("#111111"))
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, tsz(30f))
             background = null
-            maxLines = 4
+            maxLines = 5
+            includeFontPadding = false
+            gravity = Gravity.CENTER_VERTICAL
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
                 InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-            setPadding(dp(8), dp(12), dp(8), dp(12))
+            setPadding(0, u(20f), 0, u(20f))
         }
-        val micBtn = IconView(this, IconView.MIC).apply { setOnClickListener { voice() } }
-        actionIcon = IconView(this, IconView.WAVE)
-        actionBg = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(col("#D8F1EC")) }
+        val micIcon = IconView(this, IconView.MIC, col("#111111"))
+        val micBtn = micIcon.apply {
+            contentDescription = "Input suara"
+            foreground = ripple(false, 0)
+            setOnClickListener { voice() }
+        }
+        actionIcon = IconView(this, IconView.WAVE, Color.WHITE)
+        actionBg = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(col(BLUE_ACTION)) }
         val actionBtn = FrameLayout(this).apply {
+            contentDescription = "Kirim atau berhenti"
             background = actionBg
+            foreground = ripple(false, 60)
             addView(actionIcon, FrameLayout.LayoutParams(MATCH, MATCH))
             setOnClickListener { onAction() }
         }
@@ -336,32 +402,26 @@ class MainActivity : Activity() {
         val pill = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = GradientDrawable().apply { setColor(Color.WHITE); cornerRadius = dp(32).toFloat() }
-            elevation = dp(4).toFloat()
-            setPadding(dp(8), dp(6), dp(8), dp(6))
-            addView(plusBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
-            addView(input, LinearLayout.LayoutParams(0, WRAP, 1f))
-            addView(micBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
-            addView(actionBtn, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginStart = dp(4) })
+            minimumHeight = u(106f)
+            background = GradientDrawable().apply { setColor(Color.WHITE); cornerRadius = u(100f).toFloat() }
+            softShadow(this, u(7f).toFloat(), 46)
+            setPadding(u(6f), 0, u(19f), 0)
+            addView(plusBtn, LinearLayout.LayoutParams(u(88f), u(88f)))
+            addView(input, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = u(6f) })
+            addView(micBtn, LinearLayout.LayoutParams(u(88f), u(88f)))
+            addView(actionBtn, LinearLayout.LayoutParams(u(66f), u(66f)).apply { marginStart = u(26f) })
         }
-
-        folderHint = TextView(this).apply {
-            textSize = 12f
-            setTextColor(col("#5F6B7A"))
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.MIDDLE
-            setPadding(dp(16), 0, dp(16), dp(4))
-            setOnClickListener { showSettings() }
-        }
-        updateFolderHint()
+        refreshAction()
 
         root.addView(topBar, LinearLayout.LayoutParams(MATCH, WRAP))
-        root.addView(folderHint, LinearLayout.LayoutParams(MATCH, WRAP))
         root.addView(center, LinearLayout.LayoutParams(MATCH, 0, 1f))
-        root.addView(pill, LinearLayout.LayoutParams(MATCH, WRAP).apply { setMargins(dp(12), dp(4), dp(12), dp(12)) })
+        root.addView(pill, LinearLayout.LayoutParams(MATCH, WRAP).apply {
+            setMargins(u(32f), u(8f), u(32f), u(50f))
+        })
         setContentView(root)
 
         store = ChatStore(this)
+        showLastCrashIfAny()
         registerInstallReceiver()
         restoreActiveChat()
         val perms = arrayListOf("com.termux.permission.RUN_COMMAND")
@@ -411,9 +471,12 @@ class MainActivity : Activity() {
         super.onResume()
         inForeground = true
         val f = pendingInstall
-        if (f != null && f.exists() && (Build.VERSION.SDK_INT < 26 || packageManager.canRequestPackageInstalls())) {
+        if (f != null && awaitingInstallPermission) {
+            awaitingInstallPermission = false
             pendingInstall = null
-            installWithSession(f)
+            if (f.exists() && (Build.VERSION.SDK_INT < 26 || packageManager.canRequestPackageInstalls())) {
+                installWithSession(f)
+            }
         }
     }
 
@@ -426,22 +489,22 @@ class MainActivity : Activity() {
 
     private fun refreshAction() {
         if (!::actionIcon.isInitialized) return
+        actionIcon.color = Color.WHITE
         if (busy) {
             actionIcon.type = IconView.STOP
-            actionIcon.color = Color.WHITE
-            actionBg.setColor(col("#C2410C"))
+            actionBg.setColor(col("#1B1B1F"))
             return
         }
         val has = !input.text.isNullOrBlank()
         actionIcon.type = if (has) IconView.SEND else IconView.WAVE
-        actionIcon.color = if (has) Color.WHITE else col("#1F1F1F")
-        actionBg.setColor(if (has) col("#0F766E") else col("#D8F1EC"))
+        actionBg.setColor(col(BLUE_ACTION))
     }
 
     private fun updateFolderHint() {
         if (!::folderHint.isInitialized) return
         val w = (prefs.getString("workdir", "") ?: "").trim()
-        folderHint.text = if (w.isEmpty()) "Folder kerja belum dipilih · ketuk untuk mengatur" else "Folder kerja · $w"
+        folderHint.text = if (w.isEmpty()) "Pilih folder kerja" else "Folder kerja · " + shortPath(w)
+        refreshWelcomeFolder()
     }
 
     private fun workDirAbs(): String {
@@ -555,6 +618,7 @@ class MainActivity : Activity() {
     private fun updateModelLabel() {
         val n = if (preset(prov).fmt == "cli") "CLI" else cfgModel().ifBlank { prov }
         modelLabel.text = n + "  ▾"
+        modelChip?.text = n
     }
 
     private fun pickModel() {
@@ -796,6 +860,163 @@ class MainActivity : Activity() {
         return out.filter { it.isNotBlank() }.sorted()
     }
 
+
+
+    // ------------------------------------------------ Layar sambutan & aksi cepat
+
+    private fun workDirSet(): Boolean = (prefs.getString("workdir", "") ?: "").trim().isNotEmpty()
+
+    private fun shortPath(p: String, max: Int = 34): String =
+        if (p.length <= max) p else "…" + p.takeLast(max - 1)
+
+    private fun refreshWelcomeFolder() {
+        val chip = welcomeFolder ?: return
+        val w = (prefs.getString("workdir", "") ?: "").trim()
+        if (w.isEmpty()) {
+            chip.text = "Langkah 1: ketuk di sini untuk memilih folder kerja"
+            chip.setTextColor(col("#B45309"))
+            chip.background = GradientDrawable().apply { setColor(col("#FFF1E0")); cornerRadius = dp(14).toFloat() }
+        } else {
+            chip.text = "Folder kerja · " + shortPath(w) + "  (ketuk untuk ganti)"
+            chip.setTextColor(col("#0B6FD2"))
+            chip.background = GradientDrawable().apply { setColor(col("#E6F1FD")); cornerRadius = dp(14).toFloat() }
+        }
+    }
+
+    private fun quickAction(prompt: String, sendNow: Boolean) {
+        if (busy) { toast("Hentikan proses dulu"); return }
+        if (!workDirSet()) {
+            toast("Pilih folder kerja dulu")
+            pickWorkDir()
+            return
+        }
+        input.setText(prompt)
+        input.setSelection(input.text.length)
+        if (sendNow) {
+            send()
+        } else {
+            input.requestFocus()
+            try {
+                (getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager)
+                    .showSoftInput(input, 0)
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun buildWelcome(): View {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+        }
+        box.addView(TextView(this).apply {
+            text = "Halo! Mau mengerjakan apa?"
+            textSize = 24f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setTextColor(col("#111111"))
+        })
+        box.addView(TextView(this).apply {
+            text = "Pilih aksi cepat di bawah, atau ketik perintahmu sendiri di kolom bawah."
+            textSize = 14f
+            setTextColor(col("#5F6B7A"))
+            setPadding(0, dp(6), 0, dp(14))
+        })
+        val chip = TextView(this).apply {
+            textSize = 14f
+            minHeight = dp(48)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            contentDescription = "Pilih atau ganti folder kerja"
+            setOnClickListener { pickWorkDir() }
+        }
+        welcomeFolder = chip
+        refreshWelcomeFolder()
+        box.addView(chip, LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = dp(14) })
+
+        data class Quick(val title: String, val desc: String, val prompt: String, val sendNow: Boolean)
+        val actions = listOf(
+            Quick("Lihat struktur proyek", "Tampilkan folder dan file utama", "Tampilkan struktur folder dan file utama di folder kerja.", true),
+            Quick("Audit proyek", "Periksa kode dan konfigurasi, lalu ringkas masalahnya",
+                "Lakukan audit proyek di folder kerja: periksa struktur, konfigurasi build, dan masalah umum. Ringkas hasilnya.", true),
+            Quick("Build APK", "Bangun proyek; error dibaca dan diperbaiki", 
+                "Build proyek di folder kerja dengan ./gradlew assembleDebug. Kalau gagal, baca error-nya lalu perbaiki kodenya.", false),
+            Quick("Tambah fitur baru", "Ketik fitur yang diinginkan setelah ini", "Di folder kerja, tambahkan fitur: ", false)
+        )
+        for (a in actions) {
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                minimumHeight = dp(64)
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(16), dp(12), dp(16), dp(12))
+                background = GradientDrawable().apply { setColor(Color.WHITE); cornerRadius = dp(16).toFloat() }
+                foreground = RippleDrawable(
+                    ColorStateList.valueOf(Color.argb(28, 0, 0, 0)), null,
+                    GradientDrawable().apply { setColor(Color.BLACK); cornerRadius = dp(16).toFloat() }
+                )
+                softShadow(this, dp(2).toFloat(), 38)
+                contentDescription = a.title + ". " + a.desc
+                setOnClickListener { quickAction(a.prompt, a.sendNow) }
+            }
+            card.addView(TextView(this).apply {
+                text = a.title
+                textSize = 16f
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                setTextColor(col("#111111"))
+            })
+            card.addView(TextView(this).apply {
+                text = a.desc
+                textSize = 13f
+                setTextColor(col("#5F6B7A"))
+            })
+            box.addView(card, LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = dp(10) })
+        }
+        return ScrollView(this).apply {
+            isFillViewport = true
+            isVerticalScrollBarEnabled = false
+            addView(box, FrameLayout.LayoutParams(MATCH, WRAP))
+        }
+    }
+
+    // ------------------------------------------------ Pencatat crash
+
+    private fun crashFile() = File(filesDir, "last_crash.txt")
+
+    private fun installCrashLogger() {
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                val sw = java.io.StringWriter()
+                e.printStackTrace(java.io.PrintWriter(sw))
+                crashFile().writeText("Thread: ${t.name}\n$sw")
+            } catch (_: Throwable) {}
+            prev?.uncaughtException(t, e)
+        }
+    }
+
+    private fun showLastCrashIfAny() {
+        val f = crashFile()
+        if (!f.exists()) return
+        val text = try { f.readText() } catch (_: Exception) { "" }
+        f.delete()
+        if (text.isBlank()) return
+        val tv = TextView(this).apply {
+            this.text = text.take(3000)
+            textSize = 11f
+            setTextIsSelectable(true)
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Aplikasi sebelumnya berhenti")
+            .setView(ScrollView(this).apply { addView(tv) })
+            .setPositiveButton("Salin") { _, _ ->
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("crash", text))
+                toast("Log tersalin")
+            }
+            .setNegativeButton("Tutup", null)
+            .show()
+    }
+
     private fun showTemplates(anchor: View) {
         val items = listOf(
             "Build APK" to "Build proyek di folder kerja dengan ./gradlew assembleDebug. Kalau gagal, baca error-nya lalu perbaiki kodenya.",
@@ -817,91 +1038,271 @@ class MainActivity : Activity() {
         m.show()
     }
 
+    // ------------------------------------------------ Pengaturan (lembar bawah modern)
+
+    private fun fieldBg(focus: Boolean) = GradientDrawable().apply {
+        setColor(col("#F3F6FA"))
+        cornerRadius = dp(14).toFloat()
+        setStroke(dp(2), col(if (focus) BLUE else "#F3F6FA"))
+    }
+
+    /** Kotak isian berlatar lembut; garis biru muncul saat fokus. [trailing] = tombol kecil di kanan. */
+    private fun inputBox(e: EditText, trailing: View? = null): LinearLayout {
+        e.apply {
+            background = null
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTextColor(col("#111111"))
+            setHintTextColor(col("#9AA3AF"))
+            includeFontPadding = false
+            setPadding(0, dp(14), 0, dp(14))
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = fieldBg(false)
+            setPadding(dp(14), 0, dp(10), 0)
+            addView(e, LinearLayout.LayoutParams(0, WRAP, 1f))
+            if (trailing != null) addView(trailing, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(8) })
+        }
+        e.setOnFocusChangeListener { _, f -> box.background = fieldBg(f) }
+        return box
+    }
+
+    private fun sectionTitle(t: String, top: Int = 22) = TextView(this).apply {
+        text = t
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        setTextColor(col("#5B6573"))
+        layoutParams = LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(top); bottomMargin = dp(8) }
+    }
+
+    private fun helperText(t: String) = TextView(this).apply {
+        text = t
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+        setTextColor(col("#7A8594"))
+        layoutParams = LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = dp(8) }
+    }
+
+    private fun switchRow(title: String, desc: String, on: Boolean): Pair<LinearLayout, Switch> {
+        val sw = Switch(this).apply {
+            isChecked = on
+            thumbTintList = ColorStateList.valueOf(Color.WHITE)
+            trackTintList = ColorStateList(
+                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                intArrayOf(col(BLUE), col("#C9D1DC"))
+            )
+        }
+        val texts = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(TextView(context).apply {
+                text = title
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15.5f)
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                setTextColor(col("#111111"))
+            })
+            addView(TextView(context).apply {
+                text = desc
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setTextColor(col("#7A8594"))
+                setPadding(0, dp(2), 0, 0)
+            })
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = GradientDrawable().apply { setColor(col("#F3F6FA")); cornerRadius = dp(14).toFloat() }
+            setPadding(dp(14), dp(12), dp(12), dp(12))
+            addView(texts, LinearLayout.LayoutParams(0, WRAP, 1f))
+            addView(sw, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(12) })
+            setOnClickListener { sw.toggle() }
+        }
+        return row to sw
+    }
+
     private fun showSettings() {
         val names = presets.map { it.name }
-        val spin = Spinner(this)
-        spin.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
-        val base = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        var cur = prov
+        val dlg = android.app.Dialog(this)
+        dlg.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+
+        // --- Penyedia AI
+        val provValue = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTextColor(col("#111111"))
+            maxLines = 1
         }
+        val chevronDown = IconView(this, IconView.CHEVRON, col("#5B6573")).apply { rotation = 90f }
+        val provBox = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = fieldBg(false)
+            setPadding(dp(14), dp(14), dp(10), dp(14))
+            addView(provValue, LinearLayout.LayoutParams(0, WRAP, 1f))
+            addView(chevronDown, LinearLayout.LayoutParams(dp(20), dp(20)))
+        }
+
         val key = EditText(this).apply {
-            hint = "API key (kosongkan jika server lokal)"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setSingleLine(true)
         }
+        var keyShown = false
+        fun applyKeyVis() {
+            key.transformationMethod =
+                if (keyShown) null else android.text.method.PasswordTransformationMethod.getInstance()
+            key.setSelection(key.text.length)
+        }
+        val keyToggle = TextView(this).apply {
+            text = "Tampilkan"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setTextColor(col(BLUE))
+            setPadding(dp(8), dp(8), dp(6), dp(8))
+            setOnClickListener {
+                keyShown = !keyShown
+                text = if (keyShown) "Sembunyikan" else "Tampilkan"
+                applyKeyVis()
+            }
+        }
+        val keyBox = inputBox(key, keyToggle)
+
         val mdl = EditText(this).apply {
             hint = "Nama model"
             inputType = InputType.TYPE_CLASS_TEXT
+            setSingleLine(true)
         }
+        val mdlBox = inputBox(mdl)
+
+        // --- Lanjutan: alamat API / perintah CLI (tersembunyi bila tidak perlu diubah)
+        val base = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setSingleLine(true)
+        }
+        val baseLabel = helperText("Alamat API")
+        val advBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(0, dp(4), 0, 0)
+            addView(baseLabel)
+            addView(inputBox(base))
+        }
+        val advChevron = IconView(this, IconView.CHEVRON, col("#5B6573"))
+        val advToggle = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(2), dp(12), dp(2), dp(4))
+            addView(TextView(context).apply {
+                text = "Lanjutan (alamat API)"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(col(BLUE))
+            }, LinearLayout.LayoutParams(0, WRAP, 1f))
+            addView(advChevron, LinearLayout.LayoutParams(dp(18), dp(18)))
+        }
+        fun setAdv(open: Boolean) {
+            advBox.visibility = if (open) View.VISIBLE else View.GONE
+            advChevron.rotation = if (open) 90f else 0f
+        }
+        advToggle.setOnClickListener { setAdv(advBox.visibility != View.VISIBLE) }
+
+        fun load(n: String) {
+            val p = preset(n)
+            val isCli = p.fmt == "cli"
+            provValue.text = n
+            baseLabel.text = if (isCli) "Perintah CLI — pakai {prompt} sebagai tempat pesan" else "Alamat API (base URL)"
+            base.setText(pvOf(n, "base").ifEmpty { p.base })
+            val oldKey = if (n == "Gemini") (prefs.getString("key", "") ?: "") else ""
+            key.setText(pvOf(n, "key").ifEmpty { oldKey })
+            key.hint = if (n == "Ollama lokal") "API key (tidak perlu untuk lokal)" else "API key"
+            applyKeyVis()
+            mdl.setText(pvOf(n, "model").ifEmpty { p.model })
+            keyBox.visibility = if (isCli) View.GONE else View.VISIBLE
+            mdlBox.visibility = if (isCli) View.GONE else View.VISIBLE
+            advToggle.visibility = if (isCli) View.GONE else View.VISIBLE
+            if (isCli || base.text.isNullOrBlank()) setAdv(true)
+        }
+        provBox.setOnClickListener {
+            val m = PopupMenu(this, provBox)
+            names.forEachIndexed { i, nm -> m.menu.add(0, i, i, nm) }
+            m.setOnMenuItemClickListener { mi -> cur = names[mi.itemId]; load(cur); true }
+            m.show()
+        }
+
+        // --- Folder kerja
+        val work = EditText(this).apply {
+            hint = "~/proyek atau /sdcard/proyek"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setSingleLine(true)
+            setText(prefs.getString("workdir", "") ?: "")
+        }
+        workDirField = work
+        val pickDir = FrameLayout(this).apply {
+            background = GradientDrawable().apply { setColor(col("#E6F1FD")); cornerRadius = dp(14).toFloat() }
+            addView(IconView(context, IconView.FOLDER, col(BLUE)), FrameLayout.LayoutParams(MATCH, MATCH))
+            setOnClickListener { pickWorkDir() }
+        }
+        val workRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(inputBox(work), LinearLayout.LayoutParams(0, WRAP, 1f))
+            addView(pickDir, LinearLayout.LayoutParams(dp(50), MATCH).apply { marginStart = dp(8) })
+        }
+
+        // --- Izin
+        val (fullRow, full) = switchRow(
+            "Mode otomatis penuh",
+            "Jalankan semua perintah tanpa bertanya. Tombol berhenti tetap aktif.",
+            prefs.getBoolean("fullAuto", true)
+        )
+        val (autoRow, auto) = switchRow(
+            "Setujui perintah baca saja",
+            "ls, cat, grep, find, pwd otomatis diizinkan. Ubah, hapus, dan build tetap minta izin.",
+            prefs.getBoolean("autoRead", true)
+        )
+
+        // --- Instruksi tambahan
         val extra = EditText(this).apply {
-            hint = "Instruksi tambahan untuk Kita Agent (opsional)"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            hint = "Contoh: Selalu jawab singkat dalam bahasa Indonesia"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
             minLines = 3
             gravity = Gravity.TOP
             setText(prefs.getString("extra", ""))
         }
-        val work = EditText(this).apply {
-            hint = "Folder kerja, contoh: ~/proyek atau /sdcard/proyek"
-            inputType = InputType.TYPE_CLASS_TEXT
-            setText(prefs.getString("workdir", "") ?: "")
-        }
-        workDirField = work
-        val pickDir = Button(this).apply {
-            text = "Pilih folder"
-            setOnClickListener { pickWorkDir() }
-        }
-        val full = CheckBox(this).apply {
-            text = "Mode otomatis penuh: AI menjalankan semua perintah dan menulis file sampai tugas selesai, tanpa meminta izin. Tombol berhenti tetap bisa dipakai kapan saja."
-            isChecked = prefs.getBoolean("fullAuto", true)
-        }
-        val auto = CheckBox(this).apply {
-            text = "Setujui otomatis perintah yang hanya membaca (ls, cat, grep, find, pwd, dan sejenisnya). Perintah yang mengubah, menghapus, memindahkan, build, atau menginstal tetap meminta persetujuan."
-            isChecked = prefs.getBoolean("autoRead", true)
-        }
-        val folderHelp = TextView(this).apply {
-            text = "Folder ini menjadi direktori kerja setiap perintah. Kamu tidak perlu menyebutkannya di setiap pesan."
-            textSize = 12f
-            setTextColor(col("#5F6B7A"))
-            setPadding(0, dp(8), 0, dp(4))
-        }
-        var cur = prov
-        fun load(n: String) {
-            val p = preset(n)
-            val isCli = p.fmt == "cli"
-            base.hint = if (isCli) "Perintah CLI, pakai {prompt}" else "Alamat API (base URL)"
-            base.setText(pvOf(n, "base").ifEmpty { p.base })
-            val oldKey = if (n == "Gemini") (prefs.getString("key", "") ?: "") else ""
-            key.transformationMethod = android.text.method.PasswordTransformationMethod.getInstance()
-            key.setText(pvOf(n, "key").ifEmpty { oldKey })
-            mdl.setText(pvOf(n, "model").ifEmpty { p.model })
-            key.visibility = if (isCli) View.GONE else View.VISIBLE
-            mdl.visibility = if (isCli) View.GONE else View.VISIBLE
-        }
-        spin.setSelection(names.indexOf(prov).coerceAtLeast(0))
-        spin.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                cur = names[pos]
-                load(cur)
-            }
-            override fun onNothingSelected(parent: AdapterView<*>?) {}
-        }
-        val box = LinearLayout(this).apply {
+
+        val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(8), dp(20), 0)
-            addView(folderHelp)
-            addView(work)
-            addView(pickDir)
-            addView(full)
-            addView(auto)
-            addView(spin)
-            addView(base)
-            addView(key)
-            addView(mdl)
-            addView(extra)
+            setPadding(dp(20), dp(4), dp(20), dp(16))
+            addView(sectionTitle("Model AI", 8))
+            addView(provBox)
+            addView(keyBox, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(10) })
+            addView(mdlBox, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(10) })
+            addView(advToggle)
+            addView(advBox)
+            addView(sectionTitle("Folder kerja"))
+            addView(helperText("Tempat AI menjalankan perintah, jadi tidak perlu disebut di setiap pesan."))
+            addView(workRow)
+            addView(sectionTitle("Izin"))
+            addView(fullRow)
+            addView(autoRow, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(10) })
+            addView(sectionTitle("Instruksi tambahan (opsional)"))
+            addView(inputBox(extra))
         }
-        AlertDialog.Builder(this)
-            .setTitle("Pengaturan")
-            .setView(ScrollView(this).apply { addView(box) })
-            .setPositiveButton("Simpan") { _, _ ->
+
+        val cancel = TextView(this).apply {
+            text = "Batal"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setTextColor(col("#5B6573"))
+            setPadding(dp(20), dp(12), dp(20), dp(12))
+            setOnClickListener { dlg.dismiss() }
+        }
+        val save = TextView(this).apply {
+            text = "Simpan"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply { setColor(col(BLUE)); cornerRadius = dp(100).toFloat() }
+            setPadding(dp(28), dp(12), dp(28), dp(12))
+            setOnClickListener {
                 prov = cur
                 prefs.edit()
                     .putString("prov", cur)
@@ -915,10 +1316,64 @@ class MainActivity : Activity() {
                     .apply()
                 updateModelLabel()
                 updateFolderHint()
-                workDirField = null
+                dlg.dismiss()
             }
-            .setNegativeButton("Batal", null)
-            .show()
+        }
+        val footer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL or Gravity.END
+            setPadding(dp(8), dp(10), dp(20), dp(14))
+            addView(cancel)
+            addView(save)
+        }
+
+        val handle = View(this).apply {
+            background = GradientDrawable().apply { setColor(col("#D5DBE3")); cornerRadius = dp(4).toFloat() }
+        }
+        val r = dp(28).toFloat()
+        val sheet = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE)
+                cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+            }
+            addView(handle, LinearLayout.LayoutParams(dp(40), dp(4)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(10); bottomMargin = dp(10)
+            })
+            addView(TextView(context).apply {
+                text = "Pengaturan"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                setTextColor(col("#111111"))
+                setPadding(dp(24), dp(4), dp(24), dp(4))
+            })
+            addView(ScrollView(context).apply {
+                isVerticalScrollBarEnabled = false
+                overScrollMode = View.OVER_SCROLL_NEVER
+                isFillViewport = false
+                addView(body)
+            }, LinearLayout.LayoutParams(MATCH, 0, 1f))
+            addView(View(context).apply { setBackgroundColor(col("#EEF1F5")) }, LinearLayout.LayoutParams(MATCH, 1))
+            addView(footer, LinearLayout.LayoutParams(MATCH, WRAP))
+        }
+
+        load(cur)
+        dlg.setContentView(sheet)
+        dlg.setCanceledOnTouchOutside(true)
+        dlg.setOnDismissListener { workDirField = null }
+        dlg.window?.apply {
+            setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+            setLayout(MATCH, (resources.displayMetrics.heightPixels * 0.88f).toInt())
+            setGravity(Gravity.BOTTOM)
+            setDimAmount(0.4f)
+            setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        }
+        dlg.setOnShowListener {
+            sheet.translationY = resources.displayMetrics.heightPixels * 0.3f
+            sheet.alpha = 0f
+            sheet.animate().translationY(0f).alpha(1f).setDuration(220).start()
+        }
+        dlg.show()
     }
 
     private fun confirmDelete() {
@@ -946,6 +1401,7 @@ class MainActivity : Activity() {
         chatApk = ""
         prefs.edit().remove("active_chat").apply()
         hist.clear()
+        cancelTyping()
         chatBox.removeAllViews()
         emptyState.visibility = View.VISIBLE
     }
@@ -966,7 +1422,9 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == 78 && resultCode == RESULT_OK) {
             val uri = data?.data
-            if (uri != null) importFile(uri)
+            if (uri != null) {
+                try { importFile(uri) } catch (e: Throwable) { toast("Gagal melampirkan: " + (e.message ?: "").take(80)) }
+            }
         }
         if (requestCode == 79 && resultCode == RESULT_OK) {
             val uri = data?.data
@@ -1008,29 +1466,21 @@ class MainActivity : Activity() {
 
     /** Salin file pilihan ke Download/KitaAgent agar bisa dibaca dari Termux. Mengembalikan path-nya. */
     private fun copyToDownload(uri: Uri, name: String): String {
-        val src = contentResolver.openInputStream(uri) ?: throw RuntimeException("File tidak bisa dibaca")
-        return src.use { ins ->
-            if (Build.VERSION.SDK_INT >= 29) {
-                val v = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/KitaAgent")
-                }
-                val dest = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)
-                    ?: throw RuntimeException("Gagal membuat file di Download")
-                val out = contentResolver.openOutputStream(dest) ?: throw RuntimeException("Gagal menulis file")
-                out.use { o -> ins.copyTo(o) }
-                var finalName = name
-                contentResolver.query(dest, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-                    if (c.moveToFirst()) finalName = c.getString(0)
-                }
-                "/sdcard/Download/KitaAgent/$finalName"
-            } else {
-                val dir = File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS), "KitaAgent")
-                dir.mkdirs()
+        try {
+            val src = contentResolver.openInputStream(uri) ?: throw RuntimeException("File tidak bisa dibaca")
+            return src.use { ins ->
+                val dir = File(getExternalFilesDir(null) ?: filesDir, "KitaAgent")
+                if (!dir.exists()) dir.mkdirs()
                 val f = File(dir, name)
                 f.outputStream().use { o -> ins.copyTo(o) }
-                "/sdcard/Download/KitaAgent/$name"
+                f.absolutePath
             }
+        } catch (e: Exception) {
+            val cacheF = File(cacheDir, name)
+            contentResolver.openInputStream(uri)?.use { ins ->
+                cacheF.outputStream().use { o -> ins.copyTo(o) }
+            } ?: throw RuntimeException("Gagal membaca stream file")
+            cacheF.absolutePath
         }
     }
 
@@ -1046,7 +1496,7 @@ class MainActivity : Activity() {
                     input.setSelection(input.text.length)
                     input.requestFocus()
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 runOnUiThread { toast("Gagal melampirkan: " + (e.message ?: "").take(80)) }
             }
         }.start()
@@ -1065,12 +1515,13 @@ class MainActivity : Activity() {
     private fun addMsg(kind: Int, text: String) = runOnUiThread {
         emptyState.visibility = View.GONE
         if (kind == USER) {
+            finishTyping()
             val tv = TextView(this).apply {
                 this.text = text
                 setTextIsSelectable(true)
                 textSize = 16f
-                setTextColor(col("#1F1F1F"))
-                background = GradientDrawable().apply { setColor(col("#D8F1EC")); cornerRadius = dp(20).toFloat() }
+                setTextColor(col("#111111"))
+                background = GradientDrawable().apply { setColor(col("#E6F1FD")); cornerRadius = dp(20).toFloat() }
                 setPadding(dp(14), dp(10), dp(14), dp(10))
             }
             val lp = LinearLayout.LayoutParams(WRAP, WRAP).apply {
@@ -1079,8 +1530,11 @@ class MainActivity : Activity() {
                 marginStart = dp(56)
             }
             insertBeforeStatus(tv, lp)
-        } else {
+        } else if (restoring) {
             fillMarkdown(newAiBox(), text)
+        } else {
+            finishTyping()
+            startTyping(TypeJob(newAiBox(), text, 0, true))
         }
         scrollDown()
     }
@@ -1095,15 +1549,97 @@ class MainActivity : Activity() {
         return box
     }
 
-    /** Dipanggil saat teks balasan mengalir masuk; menggambar ulang pesan yang sedang ditulis. */
-    private fun streamUpdate(text: String) = runOnUiThread {
-        emptyState.visibility = View.GONE
-        val box = streamBox ?: newAiBox().also { streamBox = it }
-        fillMarkdown(box, text)
-        scrollDown()
+    // ---- Efek mengetik: teks balasan muncul bertahap, tanpa kursor.
+
+    private class TypeJob(val box: LinearLayout, var target: String, var shown: Int, var ended: Boolean)
+
+    private var typeJob: TypeJob? = null
+    private var restoring = false
+
+    private val typeTick = object : Runnable {
+        override fun run() {
+            val j = typeJob ?: return
+            if (j.shown > j.target.length) j.shown = j.target.length
+            val backlog = j.target.length - j.shown
+            if (backlog > 0) {
+                // Tertinggal banyak -> mengejar lebih cepat; sedikit -> tetap tenang dan halus.
+                val step = (backlog / 18).coerceIn(2, 60)
+                var n = minOf(j.target.length, j.shown + step)
+                if (n < j.target.length && Character.isHighSurrogate(j.target[n - 1])) n++
+                j.shown = n
+                renderTyped(j)
+            }
+            if (j.shown >= j.target.length && j.ended) {
+                typeJob = null
+                return
+            }
+            scroll.postDelayed(this, 30)
+        }
     }
 
-    private fun streamEnd() = runOnUiThread { streamBox = null }
+    private fun startTyping(j: TypeJob) {
+        typeJob = j
+        scroll.removeCallbacks(typeTick)
+        scroll.post(typeTick)
+    }
+
+    private fun nearBottom(): Boolean {
+        val c = scroll.getChildAt(0) ?: return true
+        return c.bottom - (scroll.height + scroll.scrollY) < dp(140)
+    }
+
+    private fun renderTyped(j: TypeJob) {
+        val follow = nearBottom()
+        val done = j.shown >= j.target.length
+        val txt = if (done) j.target else partialMd(j.target.substring(0, j.shown))
+        fillMarkdown(j.box, txt)
+        j.box.tag = j.target
+        if (follow) scrollDown()
+    }
+
+    /** Sembunyikan penanda markdown yang belum lengkap di baris terakhir (mis. "**" atau "`" menggantung). */
+    private fun partialMd(t: String): String {
+        if ((t.split("```").size - 1) % 2 == 1) return t
+        val nl = t.lastIndexOf('\n')
+        val head = if (nl >= 0) t.substring(0, nl + 1) else ""
+        var line = if (nl >= 0) t.substring(nl + 1) else t
+        if ((line.split("**").size - 1) % 2 == 1) line = line.substring(0, line.lastIndexOf("**"))
+        if ((line.split("`").size - 1) % 2 == 1) line = line.substring(0, line.lastIndexOf('`'))
+        line = line.trimEnd('*')
+        return head + line
+    }
+
+    /** Selesaikan seketika animasi yang sedang berjalan (dipakai sebelum pesan baru atau saat dihentikan). */
+    private fun finishTyping() {
+        val j = typeJob ?: return
+        scroll.removeCallbacks(typeTick)
+        typeJob = null
+        fillMarkdown(j.box, j.target)
+    }
+
+    private fun cancelTyping() {
+        scroll.removeCallbacks(typeTick)
+        typeJob = null
+    }
+
+    /** Dipanggil saat teks balasan mengalir masuk; teks ditampilkan bertahap oleh animasi mengetik. */
+    private fun streamUpdate(text: String) = runOnUiThread {
+        emptyState.visibility = View.GONE
+        val j = typeJob
+        if (j == null || j.ended) {
+            finishTyping()
+            val box = newAiBox()
+            streamBox = box
+            startTyping(TypeJob(box, text, 0, false))
+        } else {
+            j.target = text
+        }
+    }
+
+    private fun streamEnd() = runOnUiThread {
+        typeJob?.ended = true
+        streamBox = null
+    }
 
     private val fenceRe = Regex("```([^\\n`]*)\\n(.*?)(```|\\z)", RegexOption.DOT_MATCHES_ALL)
     private val headRe = Regex("^(#{1,6})\\s+(.*)$")
@@ -1134,7 +1670,7 @@ class MainActivity : Activity() {
         val copy = TextView(this).apply {
             text = "Salin"
             textSize = 13f
-            setTextColor(col("#0F766E"))
+            setTextColor(col("#0B72D9"))
             setPadding(dp(8), dp(2), dp(4), dp(6))
             setOnClickListener {
                 val raw = (box.tag as? String).orEmpty()
@@ -1228,7 +1764,7 @@ class MainActivity : Activity() {
         val copy = TextView(this).apply {
             text = "Salin"
             textSize = 13f
-            setTextColor(col("#0F766E"))
+            setTextColor(col("#0B72D9"))
             setPadding(dp(8), dp(4), dp(8), dp(4))
             setOnClickListener {
                 val cm = this@MainActivity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -1342,6 +1878,7 @@ class MainActivity : Activity() {
     }
 
     private fun noteStopped() = runOnUiThread {
+        finishTyping()
         streamEnd()
         val tv = TextView(this).apply {
             text = "Dihentikan."
@@ -2205,6 +2742,8 @@ class MainActivity : Activity() {
     }
 
     private fun renderConversation() {
+        cancelTyping()
+        restoring = true
         chatBox.removeAllViews()
         streamBox = null
         feedGroup = null
@@ -2230,10 +2769,14 @@ class MainActivity : Activity() {
             }
         }
         closeGroup()
+        restoring = false
         if (chatApk.isNotBlank()) showApkButton(chatApk, false)
         emptyState.visibility = if (any || chatApk.isNotBlank()) View.GONE else View.VISIBLE
         scrollDown()
     }
+
+    private fun plainText(s: String): String =
+        s.replace(Regex("[*_`#>]+"), "").replace(Regex("\\s+"), " ").trim()
 
     private fun showHistory() {
         val items = store.list()
@@ -2245,7 +2788,9 @@ class MainActivity : Activity() {
         val baru = TextView(this).apply {
             text = "Percakapan baru"
             textSize = 16f
-            setTextColor(col("#0F766E"))
+            setTextColor(col("#0B72D9"))
+            minHeight = dp(48)
+            gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(8), dp(12), dp(8), dp(12))
             setOnClickListener {
                 dialog.dismiss()
@@ -2264,10 +2809,14 @@ class MainActivity : Activity() {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = dp(56)
                 setPadding(dp(8), dp(10), dp(4), dp(10))
             }
             val label = TextView(this).apply {
-                text = meta.title + "\n" + meta.preview.take(80)
+                val t = plainText(meta.title).take(60)
+                val sb = android.text.SpannableStringBuilder(t + "\n" + plainText(meta.preview).take(80))
+                sb.setSpan(android.text.style.StyleSpan(Typeface.BOLD), 0, t.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                text = sb
                 textSize = 14f
                 setTextColor(col("#1F1F1F"))
                 maxLines = 2
@@ -2277,12 +2826,20 @@ class MainActivity : Activity() {
                 text = "Hapus"
                 textSize = 13f
                 setTextColor(col("#B42318"))
-                setPadding(dp(8), dp(8), dp(8), dp(8))
+                minHeight = dp(48)
+                gravity = Gravity.CENTER
+                setPadding(dp(12), dp(8), dp(12), dp(8))
                 setOnClickListener {
-                    store.delete(meta.id)
-                    if (meta.id == chatId) freshChat()
-                    dialog.dismiss()
-                    showHistory()
+                    AlertDialog.Builder(this@MainActivity)
+                        .setMessage("Hapus percakapan ini?")
+                        .setNegativeButton("Batal", null)
+                        .setPositiveButton("Hapus") { _, _ ->
+                            store.delete(meta.id)
+                            if (meta.id == chatId) freshChat()
+                            dialog.dismiss()
+                            showHistory()
+                        }
+                        .show()
                 }
             }
             row.addView(label, LinearLayout.LayoutParams(0, WRAP, 1f))
@@ -2417,7 +2974,7 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             background = GradientDrawable().apply {
-                setColor(col("#0F766E"))
+                setColor(col("#0B72D9"))
                 cornerRadius = dp(22).toFloat()
             }
             setPadding(dp(18), dp(12), dp(18), dp(12))
@@ -2522,7 +3079,9 @@ class MainActivity : Activity() {
                         "3. Kembali ke Kita Agent. Pemasangan akan dilanjutkan.\n\n" +
                         "Jika halaman pengaturan tidak terbuka, buka Pengaturan > Aplikasi > Kita Agent > Instal aplikasi tidak dikenal."
                 )
+                .setOnCancelListener { pendingInstall = null; awaitingInstallPermission = false }
                 .setPositiveButton("Buka pengaturan") { _, _ ->
+                    awaitingInstallPermission = true
                     val i = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))
                     try {
                         startActivity(i)
@@ -2530,7 +3089,7 @@ class MainActivity : Activity() {
                         toast("Buka Pengaturan > Aplikasi > Kita Agent > Instal aplikasi tidak dikenal")
                     }
                 }
-                .setNegativeButton("Batal") { _, _ -> pendingInstall = null }
+                .setNegativeButton("Batal") { _, _ -> pendingInstall = null; awaitingInstallPermission = false }
                 .show()
             return
         }
