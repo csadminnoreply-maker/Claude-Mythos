@@ -1480,7 +1480,7 @@ class MainActivity : Activity() {
             contentResolver.openInputStream(uri)?.use { ins ->
                 cacheF.outputStream().use { o -> ins.copyTo(o) }
             } ?: throw RuntimeException("Gagal membaca stream file")
-            return cacheF.absolutePath
+            cacheF.absolutePath
         }
     }
 
